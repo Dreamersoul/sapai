@@ -133,7 +133,7 @@ class Player():
             
         if not self.team.check_friend(team_pet):
             raise Exception("Attempted to buy food for Pet not on team {}"
-                            .format(temp_pet))
+                            .format(team_pet))
         
         if type(team_pet).__name__ != "Pet":
             raise Exception("Attempted to buy_pet using object {}".format(team_pet))
