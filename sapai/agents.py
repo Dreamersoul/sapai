@@ -1,10 +1,13 @@
 
 
-import os,json,zlib,itertools,torch
+from argparse import Action
+import os,json,zlib,itertools,torch,random
+from collections import deque
 import numpy as np
-from sapai import Player
+from sapai import Player, data
 from sapai.battle import Battle
 from sapai.compress import compress,decompress,minimal_state
+from sapai.model import Linear_QNet, QTrainer
 
 ### Pets with a random component
 ###   Random component in the future should just be handled in an exact way
@@ -685,3 +688,283 @@ class PairwiseBattles():
         return np.array([x for x in zip(idx[0], idx[1])])
         
         
+
+
+
+class Agent:
+
+    MAX_MEMORY = 100_000
+    BATCH_SIZE = 1000
+    LR = 0.001
+    ACTIONS = 5 # buy pets
+    ACTIONS += 5 # sell pets
+    ACTIONS += 10 # combining pets
+    ACTIONS += 20 # combining buying pets
+    ACTIONS += 1 # roll
+    ACTIONS += 20 # buying food
+    ACTIONS += 7 # freeze
+    ACTIONS += 7 # unfreeze
+    ACTIONS += 10 # reordering
+
+    def __init__(self):
+        self.n_games = 0
+        self.epsilon = 0 # randomness
+        self.gamma = 0.9 # discount rate
+        self.memory = deque(maxlen=self.MAX_MEMORY) # popleft()
+        self.model = Linear_QNet(41, 256, self.ACTIONS)
+        self.trainer = QTrainer(self.model, lr=self.LR, gamma=self.gamma)
+        self.all_pets = data['pets'].values()
+        self.all_foods = data['foods'].values()
+
+    def get_state(self, player: Player):
+        # get player pet names location form data
+        state = [player.lives/10]
+        state.append(player.gold / 50) 
+        pets = [x.pet for x in player.team]
+        pet_locs = [self.get_pet_index_fraction(x.name) for x in pets]
+
+        for i in range(5):
+            if i < len(pet_locs) and pets[i].name != 'pet-none':
+                state.append(pet_locs[i])
+                state.append(pets[i].health / 50)
+                state.append(pets[i].attack / 50)
+            else:
+                state.append(-1)
+                state.append(-1)
+                state.append(-1)
+
+        pets = [x for x in player.shop.pets]
+        pet_locs = [self.get_pet_index_fraction(x.name) for x in pets]
+
+        foods = [x.name for x in player.shop.foods]
+        food_locs = [self.get_food_index_fraction(x) for x in foods]
+
+        for i in range(5):
+            if i < len(pet_locs) and pets[i].name != 'pet-none':
+                state.append(pet_locs[i])
+                state.append(pets[i].health / 50)
+                state.append(pets[i].attack / 50)
+            else:
+                state.append(-1)
+                state.append(-1)
+                state.append(-1)
+        
+        for i in range(2):
+            if i < len(food_locs):
+                state.append(food_locs[i])
+            else:
+                state.append(-1)
+        frozen_state = [ 1 if x.frozen else 0 for x in player.shop.shop_slots]
+        pets = sum(1 for e in player.shop.shop_slots if e.slot_type == 'pet')
+        while pets < 5 and len(frozen_state) < 6:
+            frozen_state.insert(3, -1)
+        while len(frozen_state) < 7:
+            frozen_state.append(-1)
+        state.extend(frozen_state)
+        return np.array(state, dtype=int)
+    def get_pet_index_fraction(self, pet_name):
+        if pet_name == 'pet-none':
+            return -1
+        return next((index for (index, d) in enumerate(self.all_pets) if d["id"] == pet_name), None)/len(self.all_pets)
+
+    def get_food_index_fraction(self, food_name):
+        if food_name == 'food-none':
+            return -1
+        return next((index for (index, d) in enumerate(self.all_foods) if d["id"] == food_name), None)/len(self.all_foods)
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done)) # popleft if MAX_MEMORY is reached
+
+    def train_long_memory(self):
+        if len(self.memory) > self.BATCH_SIZE:
+            mini_sample = random.sample(self.memory, self.BATCH_SIZE) # list of tuples
+        else:
+            mini_sample = self.memory
+
+        states, actions, rewards, next_states, dones = zip(*mini_sample)
+        self.trainer.train_step(states, actions, rewards, next_states, dones)
+        # for state, action, reward, next_state, done in mini_sample:
+        #    self.trainer.train_step(state, action, reward, next_state, done)
+
+    def train_short_memory(self, state, action, reward, next_state, done):
+        self.trainer.train_step(state, action, reward, next_state, done)
+
+    def get_action(self, state):
+        # random moves: tradeoff exploration / exploitation
+        self.epsilon = 100 - self.n_games
+        final_move = [0] * self.ACTIONS
+        if random.randint(0, 200) < self.epsilon:
+            move = random.randint(0, self.ACTIONS - 1)
+            final_move[move] = 1
+        else:
+            state0 = torch.tensor(state, dtype=torch.float)
+            prediction = self.model(state0)
+            # move = torch.argmax(prediction).item()
+            final_move = prediction.tolist()
+
+        return final_move
+
+
+def train():
+    score1 = 0
+    score2 = 0
+    agent1 = Agent()
+    agent2 = Agent()
+    player1 = Player(lives=10)
+    player2 = Player(lives=10)
+    while True:
+        player1.start_turn()
+        player2.start_turn()
+        # get old state
+        old_state1, action_probs1 = get_player_actions(agent1, player1)
+        old_state2, action_probs2 = get_player_actions(agent2, player2)
+
+        player1.end_turn()
+        player2.end_turn()
+        battle = Battle(player1.team, player2.team)
+        winner = battle.battle()
+        if winner == 0:
+            reward = 1
+            player2.lives = player2.lives - 1
+        elif winner == 1: # team 2 won
+            reward = -1
+            player1.lives = player1.lives -1
+        else:
+            reward = -0.5 # draw
+        # get new state
+        done = player1.lives == 0 or player2.lives == 0
+        if(player1.lives <=0):
+            reward = -10
+        elif(player2.lives <=0):
+            reward = 10
+        
+        new_state1 = agent1.get_state(player1)
+        new_state2 = agent2.get_state(player2)
+        agent1.train_short_memory(old_state1, action_probs1, reward, new_state1, done)
+        
+        agent2.train_short_memory(old_state2, action_probs2, reward * -1, new_state2, done)
+
+        # remember
+        agent1.remember(old_state1, action_probs1, reward, new_state1, done)
+        agent2.remember(old_state2, action_probs2, reward * -1, new_state2, done)
+
+
+        if done:
+            if(player1.lives > player2.lives):
+                score1+=1
+            elif(player1.lives <  player2.lives):
+                score2+=1
+            
+            player1 = Player(lives=10)
+            player2 = Player(lives=10)
+            agent1.n_games += 1
+            agent1.train_long_memory()
+            agent1.model.save(file_name="model_1.pth")
+            
+            agent2.n_games += 1
+            agent2.train_long_memory()
+            agent2.model.save(file_name="model_2.pth")
+            # print scores and game number
+            print("Game: {}  Score1: {}  Score2: {}".format(agent1.n_games, score1, score2))
+
+def get_player_actions(agent, player):
+    state_old = agent.get_state(player)
+    # get move
+    while player.gold > 0:
+        action_probs = agent.get_action(state_old)
+            
+        idx = np.argmax(action_probs)
+        if idx < 5:
+            action = "buy"
+        elif idx < 10:
+            action = "sell"
+        elif idx < 20:
+            action = "combine"
+        elif idx < 40:
+            action = "combine_buy"
+        elif idx < 41:
+            action = "roll"
+        elif idx < 61:
+            action = "buy_food"
+        elif idx < 68:
+            action = "freeze"
+        elif idx < 75:
+            action = "unfreeze"
+        elif idx < 85:
+            action = "reorder"
+        if tryAction(action, player, action_probs):
+            if action == "roll":
+                reward = 0.01
+            else:
+                reward = 0.1
+            state_new = agent.get_state(player)
+            agent.train_short_memory(state_old, action_probs, reward, state_new, False)
+            agent.remember(state_old, action_probs, reward, state_new, False)
+        else:
+            state_new = state_old
+            agent.train_short_memory(state_old, action_probs, -1, state_new, False)
+            agent.remember(state_old, action_probs, -1, state_new, False)
+        state_old = state_new
+
+    return state_new, action_probs
+
+
+def permutations(arr):
+    """permutations of 5 choose 2"""
+    if len(arr) == 2:
+        return [arr, [arr[1], arr[0]]]
+    else:
+        result = []
+        for i in range(len(arr)):
+            for j in permutations(arr[:i] + arr[i+1:]):
+                result.append([arr[i]] + j)
+        return result
+
+def tryAction(action, player: Player, action_probs):
+    idx = np.argmax(action_probs)
+    try:
+        if action == "buy":
+            player.buy_pet(player.shop.pets[idx])
+        elif action == "sell":
+            slot = player.team[idx - 5]
+            if slot.pet.name == "pet-none":
+                raise Exception("Pet is none") 
+            player.sell(int(idx - 5))
+        elif action == "combine":
+            comb = [(0, 1), (0, 2), (0, 3), (0, 4), (1, 2), (1, 3), (1, 4), (2, 3), (2, 4), (3, 4)]
+            player.combine(comb[idx -10][0], comb[idx-10][1])
+        elif action == "combine_buy":
+            """get permutations of 5 choose 2"""
+            perm = [each_permutation for each_permutation in itertools.permutations([0, 1, 2, 3, 4], 2)]
+            player.buy_combine(perm[idx - 20][0], perm[idx - 20][1])
+        elif action == "roll":
+            player.roll()
+        elif action == "buy_food":
+            idx = idx - 41
+            food_idx = idx // 5
+            food = player.shop.foods[food_idx]
+            pet_idx = idx % 5
+            player.buy_food(food, int(pet_idx))
+        elif action == "freeze":
+            idx = idx - 61
+            player.freeze(int(idx))
+        elif action == "unfreeze":
+            idx = idx - 68
+            player.shop.unfreeze(int(idx))
+        elif action == "reorder":
+            """get permutations of 5 choose 2"""
+            idx = idx-75
+            comb = [(0, 1), (0, 2), (0, 3), (0, 4), (1, 2), (1, 3), (1, 4), (2, 3), (2, 4), (3, 4)]
+            idxs = [0,1,2,3,4]
+            pair = comb[idx]
+            tmp = idxs[pair[0]]
+            idxs[pair[0]] = idxs[pair[1]]
+            idxs[pair[1]] = tmp
+
+            player.reorder(idxs)
+        return True
+    except Exception as inst:
+        return False
+
+if __name__ == '__main__':
+    train()
+
